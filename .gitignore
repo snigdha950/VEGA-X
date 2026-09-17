@@ -3,3 +3,8 @@ __pycache__/
 *.pyc
 *.h5
 data/tsrd/*.h5
+
+__pycache__/
+*.pyc
+*.h5
+data/tsrd/*.h5
