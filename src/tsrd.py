@@ -11,10 +11,11 @@ ToA (microseconds), Frequency (MHz), PulseWidth, AoA and Amplitude.
 
 from dataclasses import dataclass
 from pathlib import Path
+
 import h5py
 import numpy as np
 
-from .config import NUM_BANDS, NUM_SLOTS, FREQ_MIN_MHZ, FREQ_MAX_MHZ
+from .config import FREQ_MAX_MHZ, FREQ_MIN_MHZ, NUM_BANDS, NUM_SLOTS
 
 
 @dataclass
@@ -25,6 +26,7 @@ class TSRDReplay:
     band_edges_mhz: np.ndarray
     source_file: str
     pulses_loaded: int
+    pulses_in_band: int
     feature_names: list
     observed_freq_min_mhz: float
     observed_freq_max_mhz: float
@@ -41,20 +43,47 @@ class TSRDReplay:
 
 
 def _decode_names(raw):
-    return [x.decode("utf-8") if isinstance(x, (bytes, np.bytes_)) else str(x) for x in raw]
+    return [
+        x.decode("utf-8") if isinstance(x, (bytes, np.bytes_)) else str(x) for x in raw
+    ]
+
+
+def _validated_layout(h5_file):
+    if "data" not in h5_file or "metadata/feature_names" not in h5_file:
+        raise ValueError(
+            "Not a supported TSRD file: missing data or metadata/feature_names."
+        )
+    data = h5_file["data"]
+    if data.ndim != 2 or data.shape[0] == 0 or data.shape[1] == 0:
+        raise ValueError("TSRD data must be a non-empty two-dimensional dataset.")
+    names = _decode_names(h5_file["metadata/feature_names"][:])
+    if len(names) != data.shape[1]:
+        raise ValueError(
+            "TSRD feature_names length does not match the number of data columns."
+        )
+    if len(set(names)) != len(names):
+        raise ValueError("TSRD feature names must be unique.")
+    return data, names
 
 
 def inspect_tsrd(path):
     path = Path(path)
+    if not path.is_file():
+        raise FileNotFoundError(path)
     with h5py.File(path, "r") as f:
-        if "data" not in f or "metadata/feature_names" not in f:
-            raise ValueError("Not a supported TSRD file: missing data or metadata/feature_names.")
-        names = _decode_names(f["metadata/feature_names"][:])
-        shape = tuple(f["data"].shape)
+        data, names = _validated_layout(f)
+        shape = tuple(data.shape)
         receiver_range = None
         if "metadata/receiver/freq_range_mhz" in f:
-            receiver_range = f["metadata/receiver/freq_range_mhz"][:].astype(float).tolist()
-    return {"file": str(path), "shape": shape, "feature_names": names, "receiver_freq_range_mhz": receiver_range}
+            receiver_range = (
+                f["metadata/receiver/freq_range_mhz"][:].astype(float).tolist()
+            )
+    return {
+        "file": str(path),
+        "shape": shape,
+        "feature_names": names,
+        "receiver_freq_range_mhz": receiver_range,
+    }
 
 
 def load_tsrd_replay(
@@ -74,24 +103,30 @@ def load_tsrd_replay(
     as independent interception episodes.
     """
     path = Path(path)
-    if not path.exists():
+    if not path.is_file():
         raise FileNotFoundError(path)
+    if int(num_slots) != num_slots or int(num_bands) != num_bands:
+        raise ValueError("num_slots and num_bands must be integers.")
+    num_slots, num_bands = int(num_slots), int(num_bands)
     if num_slots <= 0 or num_bands <= 0:
         raise ValueError("num_slots and num_bands must be positive.")
+    if not np.isfinite(freq_min_mhz) or not np.isfinite(freq_max_mhz):
+        raise ValueError("Frequency limits must be finite.")
     if freq_max_mhz <= freq_min_mhz:
         raise ValueError("freq_max_mhz must be greater than freq_min_mhz.")
-    if min_pulses_per_cell <= 0:
-        raise ValueError("min_pulses_per_cell must be positive.")
+    if int(min_pulses_per_cell) != min_pulses_per_cell or min_pulses_per_cell <= 0:
+        raise ValueError("min_pulses_per_cell must be a positive integer.")
 
     with h5py.File(path, "r") as f:
-        names = _decode_names(f["metadata/feature_names"][:])
+        data, names = _validated_layout(f)
         try:
             toa_col = names.index("ToA")
             freq_col = names.index("Frequency")
         except ValueError as exc:
-            raise ValueError(f"TSRD file must contain ToA and Frequency. Found: {names}") from exc
+            raise ValueError(
+                f"TSRD file must contain ToA and Frequency. Found: {names}"
+            ) from exc
 
-        data = f["data"]
         toa = np.asarray(data[:, toa_col], dtype=np.float64)
         freq = np.asarray(data[:, freq_col], dtype=np.float64)
 
@@ -111,6 +146,10 @@ def load_tsrd_replay(
     band_idx = np.searchsorted(band_edges, freq, side="right") - 1
     slot_idx = np.clip(slot_idx, 0, num_slots - 1)
 
+    # Follow histogram conventions: the final band includes its right edge.
+    at_upper_edge = (band_idx == num_bands) & (freq <= float(freq_max_mhz))
+    band_idx[at_upper_edge] = num_bands - 1
+
     in_band = (band_idx >= 0) & (band_idx < num_bands)
     counts = np.zeros((num_slots, num_bands), dtype=np.int32)
     np.add.at(counts, (slot_idx[in_band], band_idx[in_band]), 1)
@@ -123,6 +162,7 @@ def load_tsrd_replay(
         band_edges_mhz=band_edges,
         source_file=str(path),
         pulses_loaded=int(toa.size),
+        pulses_in_band=int(np.sum(in_band)),
         feature_names=names,
         observed_freq_min_mhz=float(freq.min()),
         observed_freq_max_mhz=float(freq.max()),
